@@ -2,92 +2,95 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## Project
 
-Lokka is a CMS written in Ruby, designed for cloud environments (Heroku, Google App Engine) and local deployment. Built with Sinatra 4.0 and ActiveRecord 8.1, it follows WordPress-like concepts with theme and plugin extensibility.
+Lokka is a WordPress-inspired CMS written in Ruby (Sinatra 4 + ActiveRecord 8.1). Designed for cloud environments (Heroku, etc.) and local deployment. Ruby >= 3.2 required.
 
-## Common Commands
+## Commands
 
 ```bash
-# Development server
+# Install
+bundle install
+
+# Dev server (http://localhost:9292/)
 bundle exec rackup
 
-# Run all tests
-bundle exec rake spec
-
-# Run a single test file
-bundle exec rspec spec/unit/post_spec.rb
-
-# Run tests matching a pattern
-bundle exec rspec spec/integration/admin/
-
-# Database operations
+# Database
 bundle exec rake db:setup      # migrate + seed
-bundle exec rake db:migrate    # run migrations
-bundle exec rake db:seed       # seed initial data
-bundle exec rake db:reset      # delete + seed
+bundle exec rake db:migrate    # run migrations only
+bundle exec rake db:seed       # seed only
+bundle exec rake db:reset      # delete all + seed
+bundle exec rake db:delete     # drop all tables + re-migrate
 
-# Code style
-rubocop lib/
-haml-lint public/
+# Tests (Minitest + Rack::Test)
+bundle exec rake               # default: db:delete db:setup test
+bundle exec rake test           # run all tests
+ruby -Ilib:test test/integration/admin/posts_test.rb              # single file
+ruby -Ilib:test test/integration/admin/posts_test.rb -n test_name # single test
 
-# Admin JS build
-bundle exec rake admin:build_js
+# DataMapper migration tools (one-time use)
+bundle exec rake db:dump_dm SOURCE=path  # export DM data to db/dm_dump.json
+bundle exec rake db:import_dm            # import into ActiveRecord
+
+# Admin JS
+bundle exec rake admin:install_deps   # npm install in public/admin
+bundle exec rake admin:build_js       # build admin JavaScript
 ```
+
+The default `rake` task **deletes the test database** before running. `RACK_ENV` and `LOKKA_ENV` are both set to `test`.
 
 ## Architecture
 
-### Application Structure
+Entry point: `config.ru` -> `init.rb` -> `lib/lokka.rb` -> `Lokka::App` (Sinatra::Base subclass).
 
-- `lib/lokka.rb` - Top-level module with environment helpers (`Lokka.root`, `Lokka.env`)
-- `lib/lokka/app.rb` - Sinatra application base class (`Lokka::App`)
-- `lib/lokka/app/admin.rb` - Admin panel routes (`/admin/*`)
-- `lib/lokka/app/entries.rb` - Public entry display routes
-- `lib/lokka/database.rb` - ActiveRecord connection and migration management
-- `lib/lokka/helpers/` - View helpers and rendering logic
+### Core (`lib/lokka/`)
+
+- `app.rb` — Main Sinatra app. Configures sessions, CSRF, registers Padrino helpers, Sinatra::Flash, Lokka::Api, loads plugins, connects DB. Loads route files below.
+- `app/entries.rb` — Public routes: index, Atom feed, search, category/tag/date archives, single entry, comments, sitemap.xml.
+- `app/admin.rb` — `/admin/*` routes: CRUD for posts, pages, comments, categories, tags, users, snippets, field_names, themes, site settings, file uploads, preview.
+- `app/api.rb` — REST API v1 (`/api/v1/*`). Bearer token auth. Full CRUD for posts, pages, categories, tags, comments, snippets, users (read-only), site settings. `POST /api/v1/token` for token generation.
+- `before.rb` — `before` filter: locale detection, theme resolution, loads `@site` and common collections for all templates. Enforces login for `/admin/*` (except login page).
+- `database.rb` — `Lokka::Database`: ActiveRecord connection, `migrate`/`migrate!`/`seed`. Reads `database.yml` or `database.default.yml` (ERB-evaluated).
+- `helpers/helpers.rb` — Auth helpers (`login_required`, `current_user`, `logged_in?`), template type predicates (`index?`, `post?`, etc.), `bread_crumb`, `category_tree`, `comment_form`, admin entry CRUD helpers, file upload/preview.
+- `helpers/render_helper.rb` — `render_any`/`render_detect`/`partial`: tries each supported template engine (ERB, HAML) to find a matching view.
+- `importer.rb` — WordPress WXR importer.
 
 ### Models (`lib/lokka/models/`)
 
-Core models using ActiveRecord:
-- `Entry` - Base class for posts/pages (STI: `Post`, `Page`)
-- `User` - Authentication and authorship
-- `Category` - Entry categorization
-- `Tag`, `Tagging` - Polymorphic tagging system
-- `Field`, `FieldName` - Custom fields for entries
-- `Site` - Site-wide settings (singleton)
-- `Option` - Key-value configuration store
-- `Comment`, `Snippet`, `Markup`, `Theme`
+All ActiveRecord. Key patterns:
+- **Entry** (STI) — `Post` and `Page` subclasses. Custom fields via `method_missing` delegating to `Field` records. Tags via `Tagging` join table.
+- **Site** — Singleton. Dynamic option access via `method_missing` reading from `Option` table.
+- **Option** — String primary key (`name`). Key-value config store with dynamic `method_missing` access.
+- **Category** — Self-referential hierarchy (`parent_id`). `has_many :children`.
+- **User** — SHA1(password+salt) auth. `api_token` for REST API. `admin?` role check.
+- **Comment** — Statuses: MODERATED(0), APPROVED(1), SPAM(2).
+- **Tag/Tagging** — Polymorphic tagging.
 
-### Theme System (`public/theme/`)
+### Migrations (`db/migrate/`)
 
-Themes require at minimum `entries.erb` and `entry.erb`. Supports ERB, HAML, and Slim templates. Template variables: `@site`, `@entries`, `@entry`.
+- `001_create_tables.rb` — Full schema (all tables).
+- `002_add_api_token_to_users.rb` — API token column.
 
-### Plugin System (`public/plugin/`)
+### Themes and Plugins
 
-Plugins follow naming convention `lokka-<name>` and are Sinatra extensions:
+- `public/theme/<name>/` — Themes need at least `entries.erb` and `entry.erb` (ERB/HAML supported). Active theme set via `Site.theme`, resolved per-request in `before.rb`.
+- `public/plugin/lokka-<name>/` — Sinatra extensions. Define `module Lokka::Foo; def self.registered(app); ...; end; end` at `public/plugin/lokka-foo/lib/lokka/foo.rb`. Plugin i18n files auto-loaded from `i18n/` subdir.
+- `public/admin/` — Admin panel templates (ERB/HAML).
 
-```ruby
-module Lokka::PluginName
-  def self.registered(app)
-    # Add routes, helpers, etc.
-  end
-end
-```
+### Custom Permalinks
 
-Plugins can include their own `Gemfile` (auto-loaded) and `i18n/` directory.
+`not_found` in `app.rb` delegates to `custom_permalink?`/`custom_permalink_fix`/`custom_permalink_entry` helpers before rendering 404. Permalink settings managed in admin.
 
 ## Testing
 
-- Framework: RSpec with FactoryBot
-- Test database: SQLite3 (in-memory or `db/test.sqlite3`)
-- Factories: `spec/factories.rb`
-- Integration tests: `spec/integration/` (Rack::Test for HTTP testing)
-- Unit tests: `spec/unit/`
+- **Framework**: Minitest 5 + Rack::Test + FactoryBot + DatabaseCleaner (truncation)
+- **Factories**: `test/factories.rb`
+- **Test base class**: `LokkaTestCase` (includes Rack::Test::Methods, FactoryBot, Lokka::Helpers)
+- **Support**: `test/support/` — `InSiteContext` (creates default Site), `AdminLoginContext` (creates user + logs in)
+- **Integration tests**: `test/integration/` (admin and public routes)
 
-## Key Configuration
+## Database Config
 
-- Ruby >= 3.3 required
-- Database config: `database.yml` (copy from `database.default.yml`)
-- Default locale: `en` (i18n files in `i18n/`)
-- Session expires: 24 days
-- Pagination: 10 entries (public), 200 entries (admin)
+`database.default.yml` (copy to `database.yml` to customize):
+- Development/Test: SQLite3 (`db/development.sqlite3`, `db/test.sqlite3`)
+- Production: `ENV['DATABASE_URL']` (PostgreSQL)
